@@ -32,8 +32,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
     from retrieve import Retriever
+    from cache import QueryCache
+    from observability import TraceLogger
 except ModuleNotFoundError:
     from pipeline.retrieve import Retriever
+    from pipeline.cache import QueryCache
+    from pipeline.observability import TraceLogger
 
 LLM_MODEL = os.environ.get("LLM_MODEL", "Qwen/Qwen2.5-1.5B-Instruct")
 MAX_NEW_TOKENS = 512
@@ -81,6 +85,10 @@ class Generator:
         )
         self.model.eval()
         print(f"LLM ready in {time.time() - t0:.1f}s\n")
+        # Layer 09 (caching) + Layer 10 (observability)
+        self.cache = QueryCache()
+        self.tracer = TraceLogger()
+        self.use_cache = os.environ.get("RAG_CACHE", "1") != "0"
 
     def _build_prompt(self, query: str, chunks: list) -> str:
         context_lines = []
@@ -109,23 +117,48 @@ class Generator:
         return self.tokenizer.decode(gen, skip_special_tokens=True).strip()
 
     def answer(self, query: str) -> dict:
-        t0 = time.time()
+        # Layer 09: cache check — repeated query returns instantly
+        if self.use_cache:
+            hit = self.cache.get(query)
+            if hit is not None:
+                self.tracer.log({
+                    "query_id": self.tracer.new_id(), "query": query,
+                    "cache": "hit", "fallback": hit.get("fallback"),
+                    "answer": hit.get("answer", ""),
+                })
+                return hit
+
         retrieval = self.retriever.search(query, top_k=TOP_K_CONTEXT)
         chunks = retrieval["results"]
         ret_ms = retrieval["latency_ms"]
-
-        # Layer 1: rerank-floor fallback (skip LLM for weak retrievals)
+        rtrace = retrieval.get("trace", {})
         best_rerank = chunks[0]["rerank_score"] if chunks else -999
+
+        def _finalize(result: dict, gen_ms: int) -> dict:
+            # Layer 10: observability — log the full trace of this query
+            self.tracer.log({
+                "query_id": self.tracer.new_id(), "query": query, "cache": "miss",
+                "bm25_top": rtrace.get("bm25_top", []),
+                "faiss_top": rtrace.get("faiss_top", []),
+                "rrf_top": rtrace.get("rrf_top", []),
+                "reranked_top": rtrace.get("reranked_top", []),
+                "confidences": rtrace.get("confidences", []),
+                "best_rerank": round(float(best_rerank), 4),
+                "fallback": result["fallback"],
+                "retrieval_ms": ret_ms, "generation_ms": gen_ms,
+                "answer": result["answer"],
+            })
+            if self.use_cache:
+                self.cache.set(query, result)
+            return result
+
+        # Layer 1 guard: rerank-floor fallback (skip LLM for weak retrievals)
         if best_rerank < RERANK_FLOOR:
-            return {
-                "query": query,
-                "answer": FALLBACK_MSG,
-                "sources": [],
-                "fallback": True,
-                "model": LLM_MODEL,
-                "retrieval_latency_ms": ret_ms,
-                "generation_latency_ms": 0,
-            }
+            return _finalize({
+                "query": query, "answer": FALLBACK_MSG, "sources": [],
+                "fallback": True, "model": LLM_MODEL,
+                "retrieval_latency_ms": ret_ms, "generation_latency_ms": 0,
+            }, 0)
 
         # Generate
         user_msg = self._build_prompt(query, chunks)
@@ -133,7 +166,7 @@ class Generator:
         answer_text = self._generate(user_msg)
         gen_ms = int((time.time() - g0) * 1000)
 
-        # Layer 2: LLM self-refusal
+        # Layer 2 guard: LLM self-refusal
         is_refusal = "insufficient evidence" in answer_text.lower()
 
         # Parse [n] citations -> map to real sources
@@ -144,22 +177,17 @@ class Generator:
                 c = chunks[n - 1]
                 sources.append({"n": n, "title": c["title"], "url": c["url"], "cited": True})
 
-        # Fallback: model gave a real answer but emitted no [n] markers.
-        # The answer is constrained to the retrieved context, so attach the top
-        # chunks it was given as "sources consulted" — guarantees traceability.
+        # Fallback: real answer but no [n] markers -> attach the chunks it was given
+        # as "sources consulted" (generation is constrained to them anyway).
         if not sources and not is_refusal:
             for n, c in enumerate(chunks[:3], 1):
                 sources.append({"n": n, "title": c["title"], "url": c["url"], "cited": False})
 
-        return {
-            "query": query,
-            "answer": answer_text,
-            "sources": sources,
-            "fallback": is_refusal,
-            "model": LLM_MODEL,
-            "retrieval_latency_ms": ret_ms,
-            "generation_latency_ms": gen_ms,
-        }
+        return _finalize({
+            "query": query, "answer": answer_text, "sources": sources,
+            "fallback": is_refusal, "model": LLM_MODEL,
+            "retrieval_latency_ms": ret_ms, "generation_latency_ms": gen_ms,
+        }, gen_ms)
 
 
 def main():

@@ -2,6 +2,9 @@
 data/
 wiki_extracted/
 indexes/
+eval/
+logs/
+cache/
 *.bz2
 *.npy
 *.db

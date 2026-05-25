@@ -171,6 +171,13 @@ class Retriever:
             "results": top,
             "low_confidence": low_conf,
             "latency_ms": int((time.time() - t0) * 1000),
+            "trace": {
+                "bm25_top": [cid for cid, _ in bm25_hits[:10]],
+                "faiss_top": [cid for cid, _ in faiss_hits[:10]],
+                "rrf_top": [cid for cid, _ in ranked[:10]],
+                "reranked_top": [r["chunk_id"] for r in top],
+                "confidences": [r["confidence"] for r in top],
+            },
         }
 
 

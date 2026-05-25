@@ -65,6 +65,41 @@ Plus citations: every answer is traceable back to the Wikipedia articles it used
 
 ---
 
+## All ten layers
+
+The blueprint this started from is a ten-layer RAG pipeline. All ten are implemented:
+
+| # | Layer | Where |
+|---|---|---|
+| 01 | Ingest + normalize | `pipeline/parse.py`, `pipeline/chunk.py` |
+| 02 | Hybrid retrieval (BM25 + embeddings) | `pipeline/embed.py`, `pipeline/index.py` |
+| 03 | ANN + reranking (two-stage) | `pipeline/retrieve.py` |
+| 04 | Source confidence scoring | `pipeline/retrieve.py` |
+| 05 | Constrained generation | `pipeline/generate.py` |
+| 06 | Citation-backed responses | `pipeline/generate.py` |
+| 07 | Hallucination fallback | `pipeline/generate.py` |
+| 08 | Continuous evals | `pipeline/evaluate.py` |
+| 09 | Caching + memory | `pipeline/cache.py` |
+| 10 | Observability | `pipeline/observability.py` |
+
+**The three production layers, measured on a real run:**
+
+- **Evals** (`python3 pipeline/evaluate.py`) — a curated set across three buckets
+  (answerable / unanswerable-on-topic / adversarial):
+  ```
+  answerable: answer rate    100.0%   (6 q)
+  answerable: citation rate  100.0%
+  refusal rate (unans + adv) 100.0%   (6 q)  <- anti-hallucination
+  overall behaved as expected 100.0%
+  ```
+- **Caching** (`pipeline/cache.py`) — a repeated question returns from SQLite in
+  ~0.001s instead of ~10s of generation.
+- **Observability** (`pipeline/observability.py --tail N`) — every query writes a
+  trace: BM25 / FAISS / RRF order, reranked top-5 with scores, the gate verdict,
+  and per-stage latency. Any answer can be explained after the fact.
+
+---
+
 ## The numbers (real run, on an Apple M4)
 
 | Stage | Result |
@@ -144,14 +179,17 @@ RAG-that-wont-lie/
 ├── README.md
 ├── requirements.txt
 ├── plan.md                 — the architecture plan (and how it was revised)
-├── pipeline/               — the 8 scripts, one per stage
+├── pipeline/               — one script per stage / layer
 │   ├── parse.py            — (legacy slow parser, kept for the story)
 │   ├── chunk.py
 │   ├── embed.py
 │   ├── embed_test.py       — safe single-batch smoke test
-│   ├── index.py
-│   ├── retrieve.py
-│   ├── generate.py
+│   ├── index.py            — FAISS + BM25 + SQLite
+│   ├── retrieve.py         — hybrid retrieval, RRF, rerank, confidence
+│   ├── generate.py         — constrained generation, gate, citations
+│   ├── cache.py            — layer 09: query cache
+│   ├── observability.py    — layer 10: trace logging + viewer
+│   ├── evaluate.py         — layer 08: continuous evals
 │   └── test_e2e.py
 └── docs/
     ├── 1-parsing.md … 6-generation.md   — plain-English + technical, per stage
