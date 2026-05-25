@@ -1,0 +1,23 @@
+# Phase 1 — parsing Wikipedia
+wikiextractor
+mwxml
+mwparserfromhell
+
+# Phase 2 — chunking
+tiktoken
+langchain-text-splitters
+
+# Phase 3 — embedding
+sentence-transformers
+torch
+
+# Phase 4 — indexing
+faiss-cpu
+bm25s
+
+# Phase 5/6 — retrieval + generation
+transformers
+
+# shared
+numpy
+tqdm

@@ -1,0 +1,17 @@
+# Data and build artifacts — regenerate locally, never commit (tens of GB)
+data/
+wiki_extracted/
+indexes/
+*.bz2
+*.npy
+*.db
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
