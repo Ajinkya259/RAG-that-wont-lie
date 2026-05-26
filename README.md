@@ -1,214 +1,180 @@
-# RAG that won't lie
+# RAG That Won't Lie
 
-A retrieval-augmented generation system built from scratch over the **full English
-Wikipedia**, on a laptop, fully offline. The goal that started it: the "design a
-RAG system for 10 million documents with near-zero hallucination" question that
-keeps showing up online. So I gave it a shot and shipped the real thing.
+A retrieval-augmented generation (RAG) pipeline over the full English Wikipedia,
+designed for **grounded, citation-backed answers and near-zero hallucination**. It
+runs entirely on local hardware: no hosted vector database, no external LLM API.
 
-No vector-DB SaaS. No OpenAI key. No framework magic. Just the actual pipeline,
-end to end, with every step explained from first principles in [`docs/`](docs/).
-
-> **Q:** Who developed the theory of relativity?
-> **A:** Albert Einstein developed the theory of relativity. `[1]`
-> **Sources:** [1] Theory of relativity — en.wikipedia.org
->
-> **Q:** What did Albert Einstein eat for breakfast?
-> **A:** I don't have enough reliable information to answer that.
-
-The second answer is the whole point. Einstein is *in* the corpus, so retrieval
-finds him — but the chunks don't mention breakfast, so the system **refuses
-instead of making something up.** That is what "won't lie" means here.
-
----
-
-## How it works
+The defining property is restraint. When the retrieved evidence does not support an
+answer, the system returns *"insufficient evidence"* rather than generating a
+plausible-sounding guess.
 
 ```
-Wikipedia dump (25GB bz2)
-      │
-      ▼
-[1] PARSE       wikiextractor → clean text per article
-      │
-      ▼
-[2] CHUNK       sentence-aware split, 384 tokens, 50 overlap   → 13.98M chunks
-      │
-      ▼
-[3] EMBED       bge-small-en-v1.5 → 384-dim vectors (float16)
-      │
-      ▼
-[4] INDEX       FAISS (meaning) + BM25 (keywords) + SQLite (metadata)
-      │
-      ▼
-[5] RETRIEVE    hybrid search → Reciprocal Rank Fusion → cross-encoder rerank
-      │
-      ▼
-[6] GENERATE    local Qwen2.5, context-only prompt, cite sources, refuse if unsure
+Q: Who developed the theory of relativity?
+A: Albert Einstein developed the theory of relativity. [1]
+   [1] Theory of relativity — en.wikipedia.org
+
+Q: What did Albert Einstein eat for breakfast?
+A: I don't have enough reliable information to answer that.
 ```
 
-Every box is one script in [`pipeline/`](pipeline/) and one explainer in
-[`docs/`](docs/). The explainers are written in plain English first, then the
-technical detail — readable whether or not you've built RAG before.
+Einstein is well represented in the corpus, so retrieval succeeds — but no passage
+states what he ate, so the system declines to answer.
 
 ---
 
-## Why "won't lie" — the two-layer anti-hallucination design
+## Architecture
 
-1. **Confidence gate (before the LLM).** After reranking, if the best match
-   scores below a floor, the system refuses immediately and never calls the LLM.
-   Catches gibberish and off-topic questions.
-2. **Constrained generation (inside the LLM).** The model is instructed to answer
-   *only* from the retrieved passages and to say "Insufficient evidence" if the
-   answer isn't there. Catches questions that are on-topic but unanswerable from
-   the corpus (the Einstein-breakfast case).
+A ten-stage pipeline. Stages 1–4 build the searchable corpus offline; stages 5–10
+serve and govern queries online.
 
-Plus citations: every answer is traceable back to the Wikipedia articles it used.
+```
+Wikipedia dump (25GB)
+   │
+   ▼
+[1] Ingest          parse + clean wikitext (wikiextractor)
+[2] Chunk           sentence-aware split, 384 tokens, 50 overlap   → 13.98M chunks
+[3] Embed           bge-small-en-v1.5 → 384-dim vectors (float16)
+[4] Index           FAISS (semantic) + BM25 (lexical) + SQLite (metadata)
+   │
+   ▼  per query
+[5] Retrieve        hybrid search → Reciprocal Rank Fusion → cross-encoder rerank
+[6] Score           confidence from rerank relevance + source agreement
+[7] Gate            below threshold → refuse; otherwise → generate
+[8] Generate        local Qwen2.5, context-only prompt, inline citations
+   │
+   ├─ Evals (9)        curated suite, refusal-rate as the anti-hallucination metric
+   ├─ Caching (10a)    normalized-hash query cache (SQLite)
+   └─ Observability    per-query JSONL trace of the full retrieval path
+```
 
----
-
-## All ten layers
-
-The blueprint this started from is a ten-layer RAG pipeline. All ten are implemented:
-
-| # | Layer | Where |
-|---|---|---|
-| 01 | Ingest + normalize | `pipeline/parse.py`, `pipeline/chunk.py` |
-| 02 | Hybrid retrieval (BM25 + embeddings) | `pipeline/embed.py`, `pipeline/index.py` |
-| 03 | ANN + reranking (two-stage) | `pipeline/retrieve.py` |
-| 04 | Source confidence scoring | `pipeline/retrieve.py` |
-| 05 | Constrained generation | `pipeline/generate.py` |
-| 06 | Citation-backed responses | `pipeline/generate.py` |
-| 07 | Hallucination fallback | `pipeline/generate.py` |
-| 08 | Continuous evals | `pipeline/evaluate.py` |
-| 09 | Caching + memory | `pipeline/cache.py` |
-| 10 | Observability | `pipeline/observability.py` |
-
-**The three production layers, measured on a real run:**
-
-- **Evals** (`python3 pipeline/evaluate.py`) — a curated set across three buckets
-  (answerable / unanswerable-on-topic / adversarial):
-  ```
-  answerable: answer rate    100.0%   (6 q)
-  answerable: citation rate  100.0%
-  refusal rate (unans + adv) 100.0%   (6 q)  <- anti-hallucination
-  overall behaved as expected 100.0%
-  ```
-- **Caching** (`pipeline/cache.py`) — a repeated question returns from SQLite in
-  ~0.001s instead of ~10s of generation.
-- **Observability** (`pipeline/observability.py --tail N`) — every query writes a
-  trace: BM25 / FAISS / RRF order, reranked top-5 with scores, the gate verdict,
-  and per-stage latency. Any answer can be explained after the fact.
+Each stage maps to one script in [`pipeline/`](pipeline/) and one document in
+[`docs/`](docs/).
 
 ---
 
-## The numbers (real run, on an Apple M4)
+## Anti-hallucination design
 
-| Stage | Result |
+Two independent guards:
+
+1. **Confidence gate (pre-generation).** After reranking, if the top candidate
+   scores below a threshold, the query is refused before the LLM is ever called.
+   Catches off-topic and adversarial inputs.
+2. **Constrained generation (in-prompt).** The model is instructed to answer only
+   from the supplied passages and to return "insufficient evidence" otherwise.
+   Catches on-topic questions the corpus cannot actually answer.
+
+Every answer carries citations back to the source passages.
+
+---
+
+## Results (measured)
+
+Continuous evaluation (`pipeline/evaluate.py`) over a curated set in three buckets —
+answerable from corpus, on-topic but unanswerable, and adversarial:
+
+```
+answerable:  answer rate     100.0%
+answerable:  citation rate   100.0%
+refusal rate (unanswerable + adversarial)   100.0%
+overall behaved as expected 100.0%
+```
+
+| Metric | Value |
 |---|---|
-| Source | English Wikipedia dump, ~25GB compressed |
-| Articles extracted | 18.8M (incl. redirects/stubs) |
-| Usable chunks | **13.98M** |
+| Source corpus | English Wikipedia, ~25GB compressed |
+| Usable chunks | 13.98M |
 | Chunks embedded (this build) | 750,000 |
-| Embedding dim | 384 (float16) |
-| Indexes | FAISS `IndexFlatIP` + BM25 + SQLite |
-| Query latency | ~0.4–0.8s retrieval, ~10–15s generation (CPU) |
+| Embedding dimension | 384 (float16) |
+| Vector index | FAISS `IndexFlatIP` |
+| Cache hit latency | ~1 ms (vs ~10 s to generate) |
+| Query latency | ~0.4–0.8 s retrieval, ~10–15 s generation (CPU) |
 
-> This build embedded the first 750K chunks — plenty for a working, demo-able
-> system. The pipeline scales to all 14M; it's just hours of compute. See
-> [`docs/3-embedding.md`](docs/3-embedding.md) for why I stopped at 750K.
-
----
-
-## What broke (the honest part)
-
-Building this on one laptop surfaced real, specific problems — not textbook ones:
-
-- **The first parser would've taken 23 days.** A hand-rolled `mwparserfromhell`
-  loop was too slow for 22M pages. Switched to `wikiextractor` (multiprocess) →
-  done in ~3 hours. ([`docs/1-parsing.md`](docs/1-parsing.md))
-- **Embedding kept dying overnight.** The job got SIGKILLed every time the laptop
-  slept. `caffeinate -i` wasn't enough (it doesn't stop lid-close sleep).
-  ([`docs/3-embedding.md`](docs/3-embedding.md))
-- **"Python quit unexpectedly" — repeatedly.** Generation segfaulted on every
-  multi-query run. I blamed the GPU, then float16. Both wrong. The crash report
-  named the real culprit: **`libomp.dylib`** — `faiss` and `torch` each ship their
-  own OpenMP runtime and collide on a thread barrier. Fix: force single-threaded
-  OpenMP + `KMP_DUPLICATE_LIB_OK=TRUE`. The lesson: read the crash report before
-  guessing. ([`docs/6-generation.md`](docs/6-generation.md))
-
-These are documented in full where they happened, because the debugging *is* the
-build.
+The current build embeds the first 750K chunks. The pipeline scales to the full
+14M without changes; the remainder is compute time.
 
 ---
 
-## Run it yourself
+## Setup
 
 ```bash
 pip install -r requirements.txt
+```
 
-# 1. Get the Wikipedia dump (~25GB)
+Download the Wikipedia dump (~25GB):
+
+```bash
 curl -C - -L -o enwiki-latest-pages-articles-multistream.xml.bz2 \
   https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-pages-articles-multistream.xml.bz2
+```
 
-# 2. Parse → clean text
+## Usage
+
+```bash
+# 1. Parse → clean text
 wikiextractor --json --processes 10 -o wiki_extracted/ \
   enwiki-latest-pages-articles-multistream.xml.bz2
 
-# 3. Chunk
+# 2. Chunk
 python3 pipeline/chunk.py
 
-# 4. Embed (set how many in pipeline/embed.py; uses MPS/CPU)
+# 3. Embed
 python3 pipeline/embed.py
 
-# 5. Build indexes
+# 4. Build indexes (FAISS + BM25 + SQLite)
 python3 pipeline/index.py --all
 
-# 6. Ask a question
+# 5. Query
 LLM_DEVICE=cpu RETRIEVER_DEVICE=cpu \
   python3 pipeline/generate.py "Who developed the theory of relativity?"
+
+# Continuous evaluation
+python3 pipeline/evaluate.py
+
+# Inspect a query's full retrieval trace
+python3 pipeline/observability.py --tail 5
 ```
 
-The 25GB dump, the chunks, the embeddings, and the indexes are all gitignored —
-this repo is the *recipe*, not the groceries.
+The dump, extracted text, chunks, embeddings, and indexes are gitignored and
+regenerated locally.
 
 ---
 
-## Repo layout
+## Implementation notes
+
+- **Hybrid retrieval** combines BM25 (exact terms) and dense vectors (semantics)
+  via Reciprocal Rank Fusion, then reranks the top candidates with a cross-encoder.
+- **Local inference.** Embeddings use `bge-small-en-v1.5`; generation uses Qwen2.5.
+  Generation runs on CPU in float32 for stability (`float16` is unsupported on CPU).
+- **Threading.** `faiss` and `torch` each bundle an OpenMP runtime; loaded together
+  they can collide on a thread barrier and crash. The scripts set
+  `OMP_NUM_THREADS=1` and `KMP_DUPLICATE_LIB_OK=TRUE` to avoid this.
+
+---
+
+## Project structure
 
 ```
 RAG-that-wont-lie/
 ├── README.md
 ├── requirements.txt
-├── plan.md                 — the architecture plan (and how it was revised)
-├── pipeline/               — one script per stage / layer
-│   ├── parse.py            — (legacy slow parser, kept for the story)
-│   ├── chunk.py
-│   ├── embed.py
-│   ├── embed_test.py       — safe single-batch smoke test
-│   ├── index.py            — FAISS + BM25 + SQLite
-│   ├── retrieve.py         — hybrid retrieval, RRF, rerank, confidence
-│   ├── generate.py         — constrained generation, gate, citations
-│   ├── cache.py            — layer 09: query cache
-│   ├── observability.py    — layer 10: trace logging + viewer
-│   ├── evaluate.py         — layer 08: continuous evals
-│   └── test_e2e.py
-└── docs/
-    ├── 1-parsing.md … 6-generation.md   — plain-English + technical, per stage
-    ├── plans/                            — the planning docs per stage
-    └── reel-transcript.txt               — the 10-step problem that started it
+├── pipeline/
+│   ├── parse.py            # ingest: stream + clean the XML dump
+│   ├── chunk.py            # sentence-aware chunking
+│   ├── embed.py            # embeddings (bge-small-en-v1.5)
+│   ├── embed_test.py       # single-batch smoke test
+│   ├── index.py            # FAISS + BM25 + SQLite
+│   ├── retrieve.py         # hybrid retrieval, RRF, rerank, confidence
+│   ├── generate.py         # confidence gate, constrained generation, citations
+│   ├── cache.py            # query cache
+│   ├── observability.py    # per-query trace logging + viewer
+│   ├── evaluate.py         # continuous evals
+│   └── test_e2e.py         # end-to-end check
+└── docs/                   # per-stage documentation (1–6)
 ```
 
 ---
 
 ## Stack
 
-Python · wikiextractor · `bge-small-en-v1.5` (embeddings) · FAISS · bm25s ·
-`ms-marco-MiniLM-L-6-v2` (reranker) · Qwen2.5 (generation) · SQLite. All open
-source, all local.
-
----
-
-## A note on how this was built
-
-This was vibe-coded — built conversationally with Claude, end to end, including
-the debugging. The docs capture the real path: the wrong turns, the crashes, and
-the fixes, not a cleaned-up after-the-fact version.
+Python · wikiextractor · `bge-small-en-v1.5` · FAISS · bm25s ·
+`ms-marco-MiniLM-L-6-v2` (reranker) · Qwen2.5 · SQLite. All open source, all local.
